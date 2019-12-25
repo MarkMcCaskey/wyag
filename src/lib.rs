@@ -5,5 +5,6 @@ extern crate log;
 
 /// Wrappers that translate CLI commands into the underlying library.
 pub mod commands;
+pub mod object;
 /// Functions and types for dealing with repositories.
 pub mod repository;

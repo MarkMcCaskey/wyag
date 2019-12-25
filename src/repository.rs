@@ -49,7 +49,7 @@ impl Repo {
         self.gitdir.join(path)
     }
 
-    fn repo_file<P>(&self, path: P, mkdir: bool) -> Result<PathBuf, String>
+    pub fn repo_file<P>(&self, path: P, mkdir: bool) -> Result<PathBuf, String>
     where
         P: AsRef<Path>,
     {
@@ -109,7 +109,6 @@ where
             .count()
             != 0
         {
-            dbg!(fs::read_dir(&repo.worktree).unwrap().collect::<Vec<_>>());
             return Err(format!(
                 "Error: repo worktree {:?} is not empty!",
                 repo.worktree
@@ -157,4 +156,30 @@ where
     }
 
     Ok(repo)
+}
+
+pub fn repo_find<P>(path: Option<P>, required: bool) -> Result<Repo, String>
+where
+    P: AsRef<Path>,
+{
+    let pb: PathBuf = if let Some(p) = path {
+        p.as_ref().to_owned()
+    } else {
+        Path::new(".").to_owned()
+    };
+    let mut pb = pb
+        .canonicalize()
+        .expect("Could not canonicalize path in repo_find");
+
+    let with_git = pb.join(".git");
+
+    if with_git.is_dir() {
+        return Repo::new(pb, false);
+    }
+
+    if pb.pop() {
+        repo_find(Some(pb), required)
+    } else {
+        Err("At root, could not find git repo".to_owned())
+    }
 }

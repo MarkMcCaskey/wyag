@@ -5,10 +5,12 @@ use wyag::commands::*;
 #[structopt(rename_all = "kebab")]
 enum App {
     Add,
-    CatFile,
+    /// Provide content of repository objects
+    CatFile(CatFile),
     Checkout,
     Commit,
-    HashObject,
+    /// Compute object id and optionally create a blob from a file
+    HashObject(HashObject),
     /// Initialize an empty repository
     Init(Init),
     Log,
@@ -27,6 +29,8 @@ fn main() -> Result<(), String> {
 
     match args {
         App::Init(init) => cmd_init(&init),
+        App::CatFile(cf) => cmd_cat_file(&cf),
+        App::HashObject(ho) => cmd_hash_object(&ho),
         _ => unimplemented!("This command has not been implemented yet!"),
     }
 }
