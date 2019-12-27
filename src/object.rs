@@ -1,14 +1,17 @@
 use crate::repository::Repo;
 use crypto::{digest::Digest, sha1::Sha1};
 use flate2::{read::ZlibDecoder, write::ZlibEncoder};
+use std::collections::*;
 use std::io::{Read, Write};
+use std::path::PathBuf;
 use std::{fs, str};
 
 /// Generic VCS object type
-pub trait Object {
+pub trait Object: std::fmt::Debug {
     fn serialize(&self) -> Vec<u8>;
     //fn deserialize(bytes: &[u8]) -> Self;
     fn fmt_header(&self) -> &'static str;
+    fn get_specific(&self) -> ObjectSelect;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,10 +28,7 @@ impl std::default::Default for ObjectType {
     }
 }
 
-const OBJECT_TYPE_VARIANTS: &[&str] = &["commit",
-          "tag",
-          "tree",
-          "blob"];
+const OBJECT_TYPE_VARIANTS: &[&str] = &["commit", "tag", "tree", "blob"];
 
 impl ObjectType {
     pub const fn variants() -> &'static [&'static str] {
@@ -40,8 +40,7 @@ impl str::FromStr for ObjectType {
     type Err = String;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        Ok(
-        match s {
+        Ok(match s {
             "commit" => ObjectType::Commit,
             "tag" => ObjectType::Tag,
             "tree" => ObjectType::Tree,
@@ -51,26 +50,47 @@ impl str::FromStr for ObjectType {
     }
 }
 
-#[derive(Debug)]
-pub struct Commit {}
+/// Used to select a specific type of object
+#[derive(Debug, Clone)]
+pub enum ObjectSelect {
+    Commit(Commit),
+    Tag(Tag),
+    Tree(Tree),
+    Blob(Blob),
+}
+
+#[derive(Debug, Clone)]
+pub struct Commit {
+    inner: BTreeMap<String, Vec<String>>,
+}
 
 impl Commit {
     pub fn deserialize(bytes: &[u8]) -> Self {
-        todo!("deserialize commit");
+        Self {
+            inner: kvlm_parse(std::str::from_utf8(bytes).unwrap()),
+        }
+    }
+
+    pub fn get(&self, key: &str) -> Option<&Vec<String>> {
+        self.inner.get(key)
     }
 }
 
 impl Object for Commit {
     fn serialize(&self) -> Vec<u8> {
-        todo!("serialize commit");
+        kvlm_serializie(&self.inner)
     }
 
     fn fmt_header(&self) -> &'static str {
         "commit"
     }
+
+    fn get_specific(&self) -> ObjectSelect {
+        ObjectSelect::Commit(self.clone())
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Tag {}
 
 impl Tag {
@@ -87,30 +107,141 @@ impl Object for Tag {
     fn fmt_header(&self) -> &'static str {
         "tag"
     }
+
+    fn get_specific(&self) -> ObjectSelect {
+        ObjectSelect::Tag(self.clone())
+    }
 }
 
-#[derive(Debug)]
-pub struct Tree {}
+#[derive(Debug, Clone)]
+pub struct Tree {
+    leaves: Vec<TreeLeaf>,
+}
 
 impl Tree {
-    pub fn deserialize(bytes: &[u8]) -> Self {
-        todo!("deserialize tree");
+    pub fn deserialize(mut bytes: &[u8]) -> Self {
+        let mut leaves = vec![];
+        while let Ok((b, leaf)) = TreeLeaf::deserialize(bytes) {
+            leaves.push(leaf);
+            bytes = b;
+        }
+
+        Self { leaves }
+    }
+
+    pub fn iterate_leaves(&self) -> impl Iterator<Item = &TreeLeaf> {
+        self.leaves.iter()
     }
 }
 
 impl Object for Tree {
     fn serialize(&self) -> Vec<u8> {
-        todo!("serialize tree");
+        let mut out = vec![];
+        self.leaves.iter().for_each(|leaf| leaf.serialize(&mut out));
+
+        out
     }
 
     fn fmt_header(&self) -> &'static str {
         "tree"
     }
+
+    fn get_specific(&self) -> ObjectSelect {
+        ObjectSelect::Tree(self.clone())
+    }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
+pub struct TreeLeaf {
+    pub mode: u32,
+    pub path: PathBuf,
+    pub sha: String,
+}
+
+fn hex_digit_to_num(digit: u8) -> Option<u8> {
+    Some(match digit {
+        b'0' => 0,
+        b'1' => 1,
+        b'2' => 2,
+        b'3' => 3,
+        b'4' => 4,
+        b'5' => 5,
+        b'6' => 6,
+        b'7' => 7,
+        b'8' => 8,
+        b'9' => 9,
+        b'A' => 10,
+        b'B' => 11,
+        b'C' => 12,
+        b'D' => 13,
+        b'E' => 14,
+        b'F' => 15,
+        _ => return None,
+    })
+}
+
+impl TreeLeaf {
+    fn serialize(&self, out: &mut Vec<u8>) {
+        out.extend(format!("{}", self.mode).as_bytes());
+        out.push(b' ');
+        out.extend(format!("{}", self.path.to_string_lossy()).as_bytes());
+        out.push(0);
+        self.sha_to_bytes(out);
+    }
+
+    fn sha_to_bytes(&self, bytes: &mut Vec<u8>) {
+        let sha_bytes: &[u8] = self.sha.as_ref();
+        for byte_seg in sha_bytes.chunks_exact(2) {
+            let byte = hex_digit_to_num(byte_seg[1]).unwrap()
+                | (hex_digit_to_num(byte_seg[0]).unwrap() << 4);
+            bytes.push(byte);
+        }
+    }
+
+    fn deserialize<'a>(bytes: &'a [u8]) -> Result<(&'a [u8], Self), String> {
+        let spc_pos = bytes
+            .iter()
+            .position(|i| *i == b' ')
+            .ok_or_else(|| "Error parsing tree node, expected space".to_owned())?;
+        if !(spc_pos == 5 || spc_pos == 6) {
+            return Err(format!(
+                "Mode string wrong length. Expected 5 or 6 bytes found: {} bytes",
+                spc_pos
+            ));
+        }
+        let mode_str = str::from_utf8(&bytes[..spc_pos])
+            .map_err(|e| format!("Error reading mode: {:?}", e))?;
+        let mode = mode_str
+            .parse::<u32>()
+            .map_err(|e| format!("Error parsing mode: {:?}", e))?;
+
+        let nul_pos = bytes[spc_pos + 1..]
+            .iter()
+            .position(|i| *i == 0)
+            .ok_or_else(|| "Error parsing tree node, expected nul terminator".to_owned())?;
+        let path_str = str::from_utf8(&bytes[spc_pos + 1..nul_pos])
+            .map_err(|e| format!("Error reading path: {:?}", e))?;
+        let path = PathBuf::from(path_str);
+        let sha_bytes = &bytes[nul_pos + 1..nul_pos + 21];
+        if sha_bytes.len() < 20 {
+            return Err(format!(
+                "Error: expected 20 bytes for the hash, found {}",
+                sha_bytes.len()
+            ));
+        }
+        // TODO: clean up this code; can be done without extra allocation and format
+        let mut sha = String::with_capacity(20);
+        for i in 0..20 {
+            sha += &format!("{:X}", sha_bytes[i]);
+        }
+
+        Ok((&bytes[nul_pos + 21..], Self { mode, path, sha }))
+    }
+}
+
+#[derive(Debug, Clone)]
 pub struct Blob {
-    data: Vec<u8>,
+    pub data: Vec<u8>,
 }
 
 impl Blob {
@@ -128,6 +259,10 @@ impl Object for Blob {
 
     fn fmt_header(&self) -> &'static str {
         "blob"
+    }
+
+    fn get_specific(&self) -> ObjectSelect {
+        ObjectSelect::Blob(self.clone())
     }
 }
 
@@ -158,9 +293,12 @@ pub fn object_read(repo: &Repo, sha_str: &str) -> Result<Box<dyn Object>, String
     let size = {
         let size_str =
             str::from_utf8(&raw_bytes[space_idx + 1..nul_idx]).expect("valid utf8 for size field");
-        size_str
-            .parse::<usize>()
-            .map_err(|e| format!("could not parse size field, \"{}\" as a number: {:?}", size_str, e))?
+        size_str.parse::<usize>().map_err(|e| {
+            format!(
+                "could not parse size field, \"{}\" as a number: {:?}",
+                size_str, e
+            )
+        })?
     };
 
     if size != raw_bytes.len() - nul_idx - 1 {
@@ -182,15 +320,17 @@ pub fn object_read(repo: &Repo, sha_str: &str) -> Result<Box<dyn Object>, String
     })
 }
 
-pub fn object_find<'a>(repo: &Repo, name: &'a str, fmt: Option<ObjectType>, follow: bool) -> &'a str {
+pub fn object_find<'a>(
+    repo: &Repo,
+    name: &'a str,
+    fmt: Option<ObjectType>,
+    follow: bool,
+) -> &'a str {
     return name;
 }
 
 /// Passing a repo means it will write
-pub fn object_write(
-    repo: Option<&Repo>,
-    object: &dyn Object,
-) -> Result<String, String> {
+pub fn object_write(repo: Option<&Repo>, object: &dyn Object) -> Result<String, String> {
     let mut obj_bytes: Vec<u8> = vec![];
     let data = object.serialize();
 
@@ -220,13 +360,18 @@ pub fn object_write(
     Ok(hex_out)
 }
 
-pub fn object_hash<R>(reader: &mut R, _type: ObjectType, repo: Option<&Repo>) -> Result<String, String>
-where R: Read {
+pub fn object_hash<R>(
+    reader: &mut R,
+    _type: ObjectType,
+    repo: Option<&Repo>,
+) -> Result<String, String>
+where
+    R: Read,
+{
     let mut data = vec![];
     reader.read_to_end(&mut data).unwrap();
     // TODO: refactor to avoid Box
-    let obj: Box<dyn Object> = 
-    match _type {
+    let obj: Box<dyn Object> = match _type {
         ObjectType::Blob => Box::new(Blob::deserialize(&data)),
         ObjectType::Commit => Box::new(Commit::deserialize(&data)),
         ObjectType::Tag => Box::new(Tag::deserialize(&data)),
@@ -234,4 +379,67 @@ where R: Read {
     };
 
     object_write(repo, &*obj)
+}
+
+pub fn kvlm_parse(raw: &str) -> BTreeMap<String, Vec<String>> {
+    let mut map = BTreeMap::new();
+    kvlm_parse_inner(raw, &mut map);
+    map
+}
+
+fn kvlm_parse_inner(raw: &str, map: &mut BTreeMap<String, Vec<String>>) {
+    let space_idx = raw.find(' ');
+    let newline_idx = raw.find('\n');
+
+    match (space_idx, newline_idx) {
+        (Some(spc), Some(nl)) => {
+            if nl < spc {
+                if nl != 0 {
+                    todo!("return error here");
+                }
+                map.insert("message".to_string(), vec![raw[1..].to_string()]);
+                return;
+            }
+            let key = raw[..spc].to_owned();
+            let mut inner = raw;
+            let mut value = String::new();
+            loop {
+                if let Some(n) = inner.find('\n') {
+                    value += &inner[1..=n];
+                    if inner.chars().nth(n + 1) != Some(' ') {
+                        inner = &inner[n..];
+                        break;
+                    }
+                    inner = &inner[n..];
+                } else {
+                    break;
+                }
+            }
+
+            map.entry(key).or_default().push(value);
+            return kvlm_parse_inner(inner, map);
+        }
+        _ => return,
+    }
+}
+
+pub fn kvlm_serializie(map: &BTreeMap<String, Vec<String>>) -> Vec<u8> {
+    let mut out = vec![];
+
+    for (k, v) in map.iter() {
+        if k == "message" {
+            continue;
+        }
+        out.extend(k.as_bytes());
+        for line in v {
+            out.extend(k.as_bytes());
+            out.push(b' ');
+            out.extend(line.replace("\n", "\n ").as_bytes());
+            out.push(b'\n');
+        }
+    }
+    out.push(b'\n');
+    out.extend(map["message"][0].as_bytes());
+
+    out
 }
